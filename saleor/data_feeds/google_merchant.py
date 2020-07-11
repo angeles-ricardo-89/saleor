@@ -1,15 +1,21 @@
 import csv
 import gzip
-from datetime import date
+from typing import Iterable
 
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.contrib.syndication.views import add_domain
 from django.core.files.storage import default_storage
+from django.utils import timezone
 from django.utils.encoding import smart_text
+from django_countries.fields import Country
 
-from ..discount.models import Sale
+from ..core.taxes import charge_taxes_on_shipping
+from ..discount import DiscountInfo
+from ..discount.utils import fetch_discounts
+from ..plugins.manager import get_plugins_manager
 from ..product.models import Attribute, AttributeValue, Category, ProductVariant
+from ..warehouse.availability import is_variant_in_stock
 
 CATEGORY_SEPARATOR = " > "
 
@@ -20,7 +26,6 @@ ATTRIBUTES = [
     "title",
     "product_type",
     "google_product_category",
-    "link",
     "image_link",
     "condition",
     "availability",
@@ -55,31 +60,27 @@ def get_feed_items():
     return items
 
 
-def item_id(item):
+def item_id(item: ProductVariant):
     return item.sku
 
 
-def item_mpn(item):
+def item_mpn(item: ProductVariant):
     return str(item.sku)
 
 
-def item_guid(item):
+def item_guid(item: ProductVariant):
     return item.sku
 
 
-def item_link(item, current_site):
-    return add_domain(current_site.domain, item.get_absolute_url(), not settings.DEBUG)
-
-
-def item_title(item):
+def item_title(item: ProductVariant):
     return item.display_product()
 
 
-def item_description(item):
-    return item.product.description[:100]
+def item_description(item: ProductVariant):
+    return item.product.plain_text_description[:100]
 
 
-def item_condition(item):
+def item_condition(item: ProductVariant):
     """Return a valid item condition.
 
     Allowed values: new, refurbished, and used.
@@ -89,7 +90,7 @@ def item_condition(item):
     return "new"
 
 
-def item_brand(item, attributes_dict, attribute_values_dict):
+def item_brand(item: ProductVariant, attributes_dict, attribute_values_dict):
     """Return an item brand.
 
     This field is required.
@@ -110,29 +111,39 @@ def item_brand(item, attributes_dict, attribute_values_dict):
         if brand is None:
             brand = item.product.attributes.get(str(publisher_attribute_pk))
 
-    if brand is not None:
+    if brand:
         brand_name = attribute_values_dict.get(brand)
         if brand_name is not None:
             return brand_name
     return brand
 
 
-def item_tax(item, discounts):
+def item_tax(
+    item: ProductVariant,
+    discounts: Iterable[DiscountInfo],
+    is_charge_taxes_on_shipping: bool,
+):
     """Return item tax.
 
     For some countries you need to set tax info
     Read more:
     https://support.google.com/merchants/answer/6324454
     """
-    price = item.get_price(discounts=discounts)
-    return "US::%s:y" % price.tax
+    country = Country(settings.DEFAULT_COUNTRY)
+    tax_rate = get_plugins_manager().get_tax_rate_percentage_value(
+        item.product.product_type, country
+    )
+    if tax_rate:
+        tax_ship = "yes" if is_charge_taxes_on_shipping else "no"
+        return "%s::%s:%s" % (country.code, tax_rate, tax_ship)
+    return None
 
 
-def item_group_id(item):
+def item_group_id(item: ProductVariant):
     return str(item.product.pk)
 
 
-def item_image_link(item, current_site):
+def item_image_link(item: ProductVariant, current_site):
     product_image = item.get_first_image()
     if product_image:
         image = product_image.image
@@ -140,13 +151,13 @@ def item_image_link(item, current_site):
     return None
 
 
-def item_availability(item):
-    if item.quantity_available:
+def item_availability(item: ProductVariant):
+    if is_variant_in_stock(item, settings.DEFAULT_COUNTRY):
         return "in stock"
     return "out of stock"
 
 
-def item_google_product_category(item, category_paths):
+def item_google_product_category(item: ProductVariant, category_paths):
     """Return a canonical product category.
 
     To have your categories accepted, please use names accepted by Google or
@@ -155,6 +166,8 @@ def item_google_product_category(item, category_paths):
     https://support.google.com/merchants/answer/6324436
     """
     category = item.product.category
+    if not category:
+        raise Exception(f"Item {item} does not have category")
     if category.pk in category_paths:
         return category_paths[category.pk]
     ancestors = [ancestor.name for ancestor in list(category.get_ancestors())]
@@ -163,24 +176,25 @@ def item_google_product_category(item, category_paths):
     return category_path
 
 
-def item_price(item):
+def item_price(item: ProductVariant):
     price = item.get_price(discounts=None)
-    return "%s %s" % (price.gross.amount, price.currency)
+    return "%s %s" % (price.amount, price.currency)
 
 
-def item_sale_price(item, discounts):
+def item_sale_price(item: ProductVariant, discounts: Iterable[DiscountInfo]):
     sale_price = item.get_price(discounts=discounts)
-    return "%s %s" % (sale_price.gross.amount, sale_price.currency)
+    return "%s %s" % (sale_price.amount, sale_price.currency)
 
 
 def item_attributes(
-    item,
+    item: ProductVariant,
     categories,
     category_paths,
     current_site,
-    discounts,
+    discounts: Iterable[DiscountInfo],
     attributes_dict,
     attribute_values_dict,
+    is_charge_taxes_on_shipping: bool,
 ):
     product_data = {
         "id": item_id(item),
@@ -191,7 +205,6 @@ def item_attributes(
         "item_group_id": item_group_id(item),
         "availability": item_availability(item),
         "google_product_category": item_google_product_category(item, category_paths),
-        "link": item_link(item, current_site),
     }
 
     image_link = item_image_link(item, current_site)
@@ -204,7 +217,7 @@ def item_attributes(
     if sale_price != price:
         product_data["sale_price"] = sale_price
 
-    tax = item_tax(item, discounts)
+    tax = item_tax(item, discounts, is_charge_taxes_on_shipping)
     if tax:
         product_data["tax"] = tax
 
@@ -217,12 +230,11 @@ def item_attributes(
 
 def write_feed(file_obj):
     """Write feed contents info provided file object."""
+    is_charge_taxes_on_shipping = charge_taxes_on_shipping()
     writer = csv.DictWriter(file_obj, ATTRIBUTES, dialect=csv.excel_tab)
     writer.writeheader()
     categories = Category.objects.all()
-    discounts = Sale.objects.active(date.today()).prefetch_related(
-        "products", "categories"
-    )
+    discounts = fetch_discounts(timezone.now())
     attributes_dict = {a.slug: a.pk for a in Attribute.objects.all()}
     attribute_values_dict = {
         smart_text(a.pk): smart_text(a) for a in AttributeValue.objects.all()
@@ -238,6 +250,7 @@ def write_feed(file_obj):
             discounts,
             attributes_dict,
             attribute_values_dict,
+            is_charge_taxes_on_shipping,
         )
         writer.writerow(item_data)
 

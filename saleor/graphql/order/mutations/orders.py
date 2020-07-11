@@ -2,21 +2,29 @@ import graphene
 from django.core.exceptions import ValidationError
 
 from ....account.models import User
-from ....core.utils.taxes import ZERO_TAXED_MONEY
+from ....core.permissions import OrderPermissions
+from ....core.taxes import zero_taxed_money
 from ....order import events, models
-from ....order.utils import cancel_order
-from ....payment import CustomPaymentChoices, PaymentError
-from ....payment.utils import (
+from ....order.actions import (
+    cancel_order,
     clean_mark_order_as_paid,
-    gateway_capture,
-    gateway_refund,
-    gateway_void,
+    handle_fully_paid_order,
     mark_order_as_paid,
+    order_captured,
+    order_refunded,
+    order_shipping_updated,
+    order_voided,
 )
-from ....shipping.models import ShippingMethod as ShippingMethodModel
+from ....order.error_codes import OrderErrorCode
+from ....order.utils import get_valid_shipping_methods_for_order
+from ....payment import CustomPaymentChoices, PaymentError, gateway
 from ...account.types import AddressInput
 from ...core.mutations import BaseMutation
-from ...core.scalars import Decimal
+from ...core.scalars import UUID, Decimal
+from ...core.types.common import OrderError
+from ...core.utils import validate_required_string_field
+from ...meta.deprecated.mutations import ClearMetaBaseMutation, UpdateMetaBaseMutation
+from ...meta.deprecated.types import MetaInput, MetaPath
 from ...order.mutations.draft_orders import DraftOrderUpdate
 from ...order.types import Order, OrderEvent
 from ...shipping.types import ShippingMethod
@@ -26,32 +34,49 @@ def clean_order_update_shipping(order, method):
     if not order.shipping_address:
         raise ValidationError(
             {
-                "order": "Cannot choose a shipping method for an order without "
-                "the shipping address."
+                "order": ValidationError(
+                    "Cannot choose a shipping method for an order without "
+                    "the shipping address.",
+                    code=OrderErrorCode.ORDER_NO_SHIPPING_ADDRESS,
+                )
             }
         )
 
-    valid_methods = ShippingMethodModel.objects.applicable_shipping_methods(
-        price=order.get_subtotal().gross.amount,
-        weight=order.get_total_weight(),
-        country_code=order.shipping_address.country.code,
-    )
-    valid_methods = valid_methods.values_list("id", flat=True)
-    if method.pk not in valid_methods:
+    valid_methods = get_valid_shipping_methods_for_order(order)
+    if valid_methods is None or method.pk not in valid_methods.values_list(
+        "id", flat=True
+    ):
         raise ValidationError(
-            {"shipping_method": "Shipping method cannot be used with this order."}
+            {
+                "shipping_method": ValidationError(
+                    "Shipping method cannot be used with this order.",
+                    code=OrderErrorCode.SHIPPING_METHOD_NOT_APPLICABLE,
+                )
+            }
         )
 
 
 def clean_order_cancel(order):
     if order and not order.can_cancel():
-        raise ValidationError({"order": "This order can't be canceled."})
+        raise ValidationError(
+            {
+                "order": ValidationError(
+                    "This order can't be canceled.",
+                    code=OrderErrorCode.CANNOT_CANCEL_ORDER,
+                )
+            }
+        )
 
 
 def clean_payment(payment):
     if not payment:
         raise ValidationError(
-            {"payment": "There's no payment associated with the order."}
+            {
+                "payment": ValidationError(
+                    "There's no payment associated with the order.",
+                    code=OrderErrorCode.PAYMENT_MISSING,
+                )
+            }
         )
 
 
@@ -59,7 +84,12 @@ def clean_order_capture(payment):
     clean_payment(payment)
     if not payment.is_active:
         raise ValidationError(
-            {"payment": "Only pre-authorized payments can be captured"}
+            {
+                "payment": ValidationError(
+                    "Only pre-authorized payments can be captured",
+                    code=OrderErrorCode.CAPTURE_INACTIVE_PAYMENT,
+                )
+            }
         )
 
 
@@ -67,13 +97,27 @@ def clean_void_payment(payment):
     """Check for payment errors."""
     clean_payment(payment)
     if not payment.is_active:
-        raise ValidationError({"payment": "Only pre-authorized payments can be voided"})
+        raise ValidationError(
+            {
+                "payment": ValidationError(
+                    "Only pre-authorized payments can be voided",
+                    code=OrderErrorCode.VOID_INACTIVE_PAYMENT,
+                )
+            }
+        )
 
 
 def clean_refund_payment(payment):
     clean_payment(payment)
     if payment.gateway == CustomPaymentChoices.MANUAL:
-        raise ValidationError({"payment": "Manual payments can not be refunded."})
+        raise ValidationError(
+            {
+                "payment": ValidationError(
+                    "Manual payments can not be refunded.",
+                    code=OrderErrorCode.CANNOT_REFUND,
+                )
+            }
+        )
 
 
 def try_payment_action(order, user, payment, func, *args, **kwargs):
@@ -84,7 +128,9 @@ def try_payment_action(order, user, payment, func, *args, **kwargs):
         events.payment_failed_event(
             order=order, user=user, message=message, payment=payment
         )
-        raise ValidationError({"payment": message})
+        raise ValidationError(
+            {"payment": ValidationError(message, code=OrderErrorCode.PAYMENT_ERROR)}
+        )
     return True
 
 
@@ -104,7 +150,21 @@ class OrderUpdate(DraftOrderUpdate):
     class Meta:
         description = "Updates an order."
         model = models.Order
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
+
+    @classmethod
+    def clean_input(cls, info, instance, data):
+        draft_order_cleaned_input = super().clean_input(info, instance, data)
+
+        # We must to filter out field added by DraftOrderUpdate
+        editable_fields = ["billing_address", "shipping_address", "user_email"]
+        cleaned_input = {}
+        for key in draft_order_cleaned_input:
+            if key in editable_fields:
+                cleaned_input[key] = draft_order_cleaned_input[key]
+        return cleaned_input
 
     @classmethod
     def save(cls, info, instance, cleaned_input):
@@ -131,12 +191,14 @@ class OrderUpdateShipping(BaseMutation):
             description="ID of the order to update a shipping method.",
         )
         input = OrderUpdateShippingInput(
-            description="Fields required to change " "shipping method of the order."
+            description="Fields required to change shipping method of the order."
         )
 
     class Meta:
         description = "Updates a shipping method of the order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -146,17 +208,23 @@ class OrderUpdateShipping(BaseMutation):
         if not data["shipping_method"]:
             if not order.is_draft() and order.is_shipping_required():
                 raise ValidationError(
-                    {"shipping_method": "Shipping method is required for this order."}
+                    {
+                        "shipping_method": ValidationError(
+                            "Shipping method is required for this order.",
+                            code=OrderErrorCode.SHIPPING_METHOD_REQUIRED,
+                        )
+                    }
                 )
 
             order.shipping_method = None
-            order.shipping_price = ZERO_TAXED_MONEY
+            order.shipping_price = zero_taxed_money()
             order.shipping_method_name = None
             order.save(
                 update_fields=[
+                    "currency",
                     "shipping_method",
-                    "shipping_price_net",
-                    "shipping_price_gross",
+                    "shipping_price_net_amount",
+                    "shipping_price_gross_amount",
                     "shipping_method_name",
                 ]
             )
@@ -172,21 +240,26 @@ class OrderUpdateShipping(BaseMutation):
         clean_order_update_shipping(order, method)
 
         order.shipping_method = method
-        order.shipping_price = method.get_total(info.context.taxes)
+        order.shipping_price = info.context.plugins.calculate_order_shipping(order)
         order.shipping_method_name = method.name
         order.save(
             update_fields=[
+                "currency",
                 "shipping_method",
                 "shipping_method_name",
-                "shipping_price_net",
-                "shipping_price_gross",
+                "shipping_price_net_amount",
+                "shipping_price_gross_amount",
             ]
         )
+        # Post-process the results
+        order_shipping_updated(order)
         return OrderUpdateShipping(order=order)
 
 
 class OrderAddNoteInput(graphene.InputObjectType):
-    message = graphene.String(description="Note message.", name="message")
+    message = graphene.String(
+        description="Note message.", name="message", required=True
+    )
 
 
 class OrderAddNote(BaseMutation):
@@ -205,13 +278,30 @@ class OrderAddNote(BaseMutation):
 
     class Meta:
         description = "Adds note to the order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
+
+    @classmethod
+    def clean_input(cls, _info, _instance, data):
+        try:
+            cleaned_input = validate_required_string_field(data["input"], "message")
+        except ValidationError:
+            raise ValidationError(
+                {
+                    "message": ValidationError(
+                        "Message can't be empty.", code=OrderErrorCode.REQUIRED,
+                    )
+                }
+            )
+        return cleaned_input
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
+        cleaned_input = cls.clean_input(info, order, data)
         event = events.order_note_added_event(
-            order=order, user=info.context.user, message=data.get("input")["message"]
+            order=order, user=info.context.user, message=cleaned_input["message"],
         )
         return OrderAddNote(order=order, event=event)
 
@@ -221,19 +311,18 @@ class OrderCancel(BaseMutation):
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of the order to cancel.")
-        restock = graphene.Boolean(
-            required=True, description="Determine if lines will be restocked or not."
-        )
 
     class Meta:
         description = "Cancel an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, restock, **data):
+    def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
         clean_order_cancel(order)
-        cancel_order(user=info.context.user, order=order, restock=restock)
+        cancel_order(order=order, user=info.context.user)
         return OrderCancel(order=order)
 
 
@@ -245,12 +334,23 @@ class OrderMarkAsPaid(BaseMutation):
 
     class Meta:
         description = "Mark order as manually paid."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
+
+    @classmethod
+    def clean_billing_address(cls, instance):
+        if not instance.billing_address:
+            raise ValidationError(
+                "Order billing address is required to mark order as paid.",
+                code=OrderErrorCode.BILLING_ADDRESS_NOT_SET,
+            )
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
 
+        cls.clean_billing_address(order)
         try_payment_action(
             order, info.context.user, None, clean_mark_order_as_paid, order
         )
@@ -268,24 +368,32 @@ class OrderCapture(BaseMutation):
 
     class Meta:
         description = "Capture an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, amount, **data):
         if amount <= 0:
-            raise ValidationError({"amount": "Amount should be a positive number."})
+            raise ValidationError(
+                {
+                    "amount": ValidationError(
+                        "Amount should be a positive number.",
+                        code=OrderErrorCode.ZERO_QUANTITY,
+                    )
+                }
+            )
 
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
         payment = order.get_last_payment()
         clean_order_capture(payment)
 
         try_payment_action(
-            order, info.context.user, payment, gateway_capture, payment, amount
+            order, info.context.user, payment, gateway.capture, payment, amount
         )
-
-        events.payment_captured_event(
-            order=order, user=info.context.user, amount=amount, payment=payment
-        )
+        order_captured(order, info.context.user, amount, payment)
+        if order.is_fully_paid():
+            handle_fully_paid_order(order)
         return OrderCapture(order=order)
 
 
@@ -297,7 +405,9 @@ class OrderVoid(BaseMutation):
 
     class Meta:
         description = "Void an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -305,11 +415,8 @@ class OrderVoid(BaseMutation):
         payment = order.get_last_payment()
         clean_void_payment(payment)
 
-        try_payment_action(order, info.context.user, payment, gateway_void, payment)
-
-        events.payment_voided_event(
-            order=order, user=info.context.user, payment=payment
-        )
+        try_payment_action(order, info.context.user, payment, gateway.void, payment)
+        order_voided(order, info.context.user, payment)
         return OrderVoid(order=order)
 
 
@@ -322,22 +429,84 @@ class OrderRefund(BaseMutation):
 
     class Meta:
         description = "Refund an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = OrderError
+        error_type_field = "order_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, amount, **data):
         if amount <= 0:
-            raise ValidationError({"amount": "Amount should be a positive number."})
+            raise ValidationError(
+                {
+                    "amount": ValidationError(
+                        "Amount should be a positive number.",
+                        code=OrderErrorCode.ZERO_QUANTITY,
+                    )
+                }
+            )
 
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
         payment = order.get_last_payment()
         clean_refund_payment(payment)
 
         try_payment_action(
-            order, info.context.user, payment, gateway_refund, payment, amount
+            order, info.context.user, payment, gateway.refund, payment, amount
         )
 
-        events.payment_refunded_event(
-            order=order, user=info.context.user, amount=amount, payment=payment
-        )
+        order_refunded(order, info.context.user, amount, payment)
         return OrderRefund(order=order)
+
+
+class OrderUpdateMeta(UpdateMetaBaseMutation):
+    class Meta:
+        description = "Updates meta for order."
+        model = models.Order
+        public = True
+
+    class Arguments:
+        token = UUID(description="Token of an object to update.", required=True)
+        input = MetaInput(
+            description="Fields required to update new or stored metadata item.",
+            required=True,
+        )
+
+    @classmethod
+    def get_instance(cls, info, **data):
+        token = data["token"]
+        return models.Order.objects.get(token=token)
+
+
+class OrderUpdatePrivateMeta(UpdateMetaBaseMutation):
+    class Meta:
+        description = "Updates private meta for order."
+        model = models.Order
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        public = False
+
+
+class OrderClearMeta(ClearMetaBaseMutation):
+    class Meta:
+        description = "Clears stored metadata value."
+        model = models.Order
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        public = True
+
+    class Arguments:
+        token = UUID(description="Token of an object to clear.", required=True)
+        input = MetaPath(
+            description="Fields required to update new or stored metadata item.",
+            required=True,
+        )
+
+    @classmethod
+    def get_instance(cls, info, **data):
+        token = data["token"]
+        return models.Order.objects.get(token=token)
+
+
+class OrderClearPrivateMeta(ClearMetaBaseMutation):
+    class Meta:
+        description = "Clears stored private metadata value."
+        model = models.Order
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        public = False

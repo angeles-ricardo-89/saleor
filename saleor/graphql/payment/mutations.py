@@ -2,28 +2,28 @@ import graphene
 from django.conf import settings
 from django.core.exceptions import ValidationError
 
+from ...checkout import calculations
+from ...checkout.utils import cancel_active_payments
+from ...core.permissions import OrderPermissions
+from ...core.taxes import zero_taxed_money
 from ...core.utils import get_client_ip
-from ...core.utils.taxes import get_taxes_for_address
-from ...payment import PaymentError, models
-from ...payment.utils import (
-    create_payment,
-    gateway_capture,
-    gateway_refund,
-    gateway_void,
-)
+from ...graphql.checkout.utils import clean_billing_address, clean_checkout_shipping
+from ...payment import PaymentError, gateway, models
+from ...payment.error_codes import PaymentErrorCode
+from ...payment.utils import create_payment, is_currency_supported
 from ..account.i18n import I18nMixin
 from ..account.types import AddressInput
 from ..checkout.types import Checkout
 from ..core.mutations import BaseMutation
 from ..core.scalars import Decimal
+from ..core.types import common as common_types
 from ..core.utils import from_global_id_strict_type
-from .enums import PaymentGatewayEnum
 from .types import Payment
 
 
 class PaymentInput(graphene.InputObjectType):
     gateway = graphene.Field(
-        PaymentGatewayEnum,
+        graphene.String,
         description="A gateway to use with that payment.",
         required=True,
     )
@@ -43,8 +43,13 @@ class PaymentInput(graphene.InputObjectType):
         ),
     )
     billing_address = AddressInput(
-        description="""Billing address. If empty, the billing address associated with
-            the checkout instance will be used."""
+        required=False,
+        description=(
+            "[Deprecated] Billing address. If empty, the billing address associated "
+            "with the checkout instance will be used. Use `checkoutCreate` or "
+            "`checkoutBillingAddressUpdate` mutations to set it. This field will be "
+            "removed after 2020-07-31."
+        ),
     )
 
 
@@ -60,64 +65,109 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
 
     class Meta:
         description = "Create a new payment for given checkout."
+        error_type_class = common_types.PaymentError
+        error_type_field = "payment_errors"
+
+    @classmethod
+    def calculate_total(cls, info, checkout):
+        checkout_total = (
+            calculations.checkout_total(
+                checkout=checkout,
+                lines=list(checkout),
+                discounts=info.context.discounts,
+            )
+            - checkout.get_total_gift_cards_balance()
+        )
+
+        return max(checkout_total, zero_taxed_money(checkout_total.currency))
+
+    @classmethod
+    def clean_shipping_method(cls, checkout):
+        if not checkout.shipping_method:
+            raise ValidationError(
+                {
+                    "shipping_method": ValidationError(
+                        "Shipping method not set for this checkout.",
+                        code=PaymentErrorCode.SHIPPING_METHOD_NOT_SET,
+                    )
+                }
+            )
+
+    @classmethod
+    def clean_payment_amount(cls, info, checkout_total, amount):
+        if amount != checkout_total.gross.amount:
+            raise ValidationError(
+                {
+                    "amount": ValidationError(
+                        "Partial payments are not allowed, amount should be "
+                        "equal checkout's total.",
+                        code=PaymentErrorCode.PARTIAL_PAYMENT_NOT_ALLOWED,
+                    )
+                }
+            )
+
+    @classmethod
+    def validate_gateway(cls, gateway_id, currency):
+        if not is_currency_supported(currency, gateway_id):
+            raise ValidationError(
+                {
+                    "gateway": ValidationError(
+                        f"The gateway {gateway_id} does not support checkout currency.",
+                        code=PaymentErrorCode.NOT_SUPPORTED_GATEWAY.value,
+                    )
+                }
+            )
 
     @classmethod
     def perform_mutation(cls, _root, info, checkout_id, **data):
         checkout_id = from_global_id_strict_type(
-            info, checkout_id, only_type=Checkout, field="checkout_id"
+            checkout_id, only_type=Checkout, field="checkout_id"
         )
         checkout = models.Checkout.objects.prefetch_related(
             "lines__variant__product__collections"
         ).get(pk=checkout_id)
 
-        data = data.get("input")
-        billing_address = checkout.billing_address
-        if "billing_address" in data:
-            billing_address = cls.validate_address(data["billing_address"])
-        if billing_address is None:
-            raise ValidationError(
-                {"billing_address": "No billing address associated with this checkout."}
-            )
+        data = data["input"]
+        gateway = data["gateway"]
 
-        checkout_total = checkout.get_total(
-            discounts=info.context.discounts,
-            taxes=get_taxes_for_address(checkout.billing_address),
+        cls.validate_gateway(gateway, checkout.currency)
+
+        checkout_total = cls.calculate_total(info, checkout)
+        amount = data.get("amount", checkout_total.gross.amount)
+        clean_checkout_shipping(
+            checkout, list(checkout), info.context.discounts, PaymentErrorCode
         )
-        amount = data.get("amount", checkout_total)
-        if amount < checkout_total.gross.amount:
-            raise ValidationError(
-                {
-                    "amount": "Partial payments are not allowed, amount should be "
-                    "equal checkout's total."
-                }
-            )
-
+        clean_billing_address(checkout, PaymentErrorCode)
+        cls.clean_payment_amount(info, checkout_total, amount)
         extra_data = {"customer_user_agent": info.context.META.get("HTTP_USER_AGENT")}
 
+        cancel_active_payments(checkout)
+
         payment = create_payment(
-            gateway=data["gateway"],
+            gateway=gateway,
             payment_token=data["token"],
             total=amount,
             currency=settings.DEFAULT_CURRENCY,
             email=checkout.email,
-            billing_address=billing_address,
             extra_data=extra_data,
             customer_ip_address=get_client_ip(info.context),
             checkout=checkout,
         )
-        return CheckoutPaymentCreate(payment=payment)
+        return CheckoutPaymentCreate(payment=payment, checkout=checkout)
 
 
 class PaymentCapture(BaseMutation):
-    payment = graphene.Field(Payment, description="Updated payment")
+    payment = graphene.Field(Payment, description="Updated payment.")
 
     class Arguments:
-        payment_id = graphene.ID(required=True, description="Payment ID")
-        amount = Decimal(description="Transaction amount")
+        payment_id = graphene.ID(required=True, description="Payment ID.")
+        amount = Decimal(description="Transaction amount.")
 
     class Meta:
-        description = "Captures the authorized payment amount"
-        permissions = ("order.manage_orders",)
+        description = "Captures the authorized payment amount."
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = common_types.PaymentError
+        error_type_field = "payment_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, payment_id, amount=None):
@@ -125,16 +175,18 @@ class PaymentCapture(BaseMutation):
             info, payment_id, field="payment_id", only_type=Payment
         )
         try:
-            gateway_capture(payment, amount)
+            gateway.capture(payment, amount)
         except PaymentError as e:
-            raise ValidationError(str(e))
+            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR)
         return PaymentCapture(payment=payment)
 
 
 class PaymentRefund(PaymentCapture):
     class Meta:
-        description = "Refunds the captured payment amount"
-        permissions = ("order.manage_orders",)
+        description = "Refunds the captured payment amount."
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = common_types.PaymentError
+        error_type_field = "payment_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, payment_id, amount=None):
@@ -142,21 +194,23 @@ class PaymentRefund(PaymentCapture):
             info, payment_id, field="payment_id", only_type=Payment
         )
         try:
-            gateway_refund(payment, amount=amount)
+            gateway.refund(payment, amount=amount)
         except PaymentError as e:
-            raise ValidationError(str(e))
+            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR)
         return PaymentRefund(payment=payment)
 
 
 class PaymentVoid(BaseMutation):
-    payment = graphene.Field(Payment, description="Updated payment")
+    payment = graphene.Field(Payment, description="Updated payment.")
 
     class Arguments:
-        payment_id = graphene.ID(required=True, description="Payment ID")
+        payment_id = graphene.ID(required=True, description="Payment ID.")
 
     class Meta:
-        description = "Voids the authorized payment"
-        permissions = ("order.manage_orders",)
+        description = "Voids the authorized payment."
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+        error_type_class = common_types.PaymentError
+        error_type_field = "payment_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, payment_id):
@@ -164,7 +218,30 @@ class PaymentVoid(BaseMutation):
             info, payment_id, field="payment_id", only_type=Payment
         )
         try:
-            gateway_void(payment)
+            gateway.void(payment)
         except PaymentError as e:
-            raise ValidationError(str(e))
+            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR)
         return PaymentVoid(payment=payment)
+
+
+class PaymentSecureConfirm(BaseMutation):
+    payment = graphene.Field(Payment, description="Updated payment.")
+
+    class Arguments:
+        payment_id = graphene.ID(required=True, description="Payment ID.")
+
+    class Meta:
+        description = "Confirms payment in a two-step process like 3D secure"
+        error_type_class = common_types.PaymentError
+        error_type_field = "payment_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, payment_id):
+        payment = cls.get_node_or_error(
+            info, payment_id, field="payment_id", only_type=Payment
+        )
+        try:
+            gateway.confirm(payment)
+        except PaymentError as e:
+            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR)
+        return PaymentSecureConfirm(payment=payment)

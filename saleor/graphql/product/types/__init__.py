@@ -6,7 +6,6 @@ from .products import (
     Collection,
     Product,
     ProductImage,
-    ProductOrder,
     ProductType,
     ProductVariant,
 )

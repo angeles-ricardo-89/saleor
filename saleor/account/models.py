@@ -1,4 +1,4 @@
-import uuid
+from typing import Union
 
 from django.conf import settings
 from django.contrib.auth.models import (
@@ -6,15 +6,20 @@ from django.contrib.auth.models import (
     BaseUserManager,
     PermissionsMixin,
 )
+from django.contrib.postgres.fields import JSONField
 from django.db import models
 from django.db.models import Q, Value
 from django.forms.models import model_to_dict
 from django.utils import timezone
-from django.utils.translation import pgettext_lazy
+from django.utils.crypto import get_random_string
 from django_countries.fields import Country, CountryField
 from phonenumber_field.modelfields import PhoneNumber, PhoneNumberField
 from versatileimagefield.fields import VersatileImageField
 
+from ..core.models import ModelWithMetadata
+from ..core.permissions import AccountPermissions, BasePermissionEnum
+from ..core.utils.json_serializer import CustomJsonEncoder
+from . import CustomerEvents
 from .validators import validate_possible_number
 
 
@@ -72,6 +77,8 @@ class Address(models.Model):
         return self.full_name
 
     def __eq__(self, other):
+        if not isinstance(other, Address):
+            return False
         return self.as_data() == other.as_data()
 
     __hash__ = models.Model.__hash__
@@ -124,11 +131,7 @@ class UserManager(BaseUserManager):
         return self.get_queryset().filter(is_staff=True)
 
 
-def get_token():
-    return str(uuid.uuid4())
-
-
-class User(PermissionsMixin, AbstractBaseUser):
+class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
     email = models.EmailField(unique=True)
     first_name = models.CharField(max_length=256, blank=True)
     last_name = models.CharField(max_length=256, blank=True)
@@ -136,7 +139,6 @@ class User(PermissionsMixin, AbstractBaseUser):
         Address, blank=True, related_name="user_addresses"
     )
     is_staff = models.BooleanField(default=False)
-    token = models.UUIDField(default=get_token, editable=False, unique=True)
     is_active = models.BooleanField(default=True)
     note = models.TextField(null=True, blank=True)
     date_joined = models.DateTimeField(default=timezone.now, editable=False)
@@ -147,22 +149,17 @@ class User(PermissionsMixin, AbstractBaseUser):
         Address, related_name="+", null=True, blank=True, on_delete=models.SET_NULL
     )
     avatar = VersatileImageField(upload_to="user-avatars", blank=True, null=True)
+    jwt_token_key = models.CharField(max_length=12, default=get_random_string)
 
     USERNAME_FIELD = "email"
 
     objects = UserManager()
 
     class Meta:
+        ordering = ("email",)
         permissions = (
-            (
-                "manage_users",
-                pgettext_lazy("Permission description", "Manage customers."),
-            ),
-            ("manage_staff", pgettext_lazy("Permission description", "Manage staff.")),
-            (
-                "impersonate_users",
-                pgettext_lazy("Permission description", "Impersonate customers."),
-            ),
+            (AccountPermissions.MANAGE_USERS.codename, "Manage customers."),
+            (AccountPermissions.MANAGE_STAFF.codename, "Manage staff."),
         )
 
     def get_full_name(self):
@@ -178,11 +175,10 @@ class User(PermissionsMixin, AbstractBaseUser):
     def get_short_name(self):
         return self.email
 
-    def get_ajax_label(self):
-        address = self.default_billing_address
-        if address:
-            return "%s %s (%s)" % (address.first_name, address.last_name, self.email)
-        return self.email
+    def has_perm(self, perm: Union[BasePermissionEnum, str], obj=None):  # type: ignore
+        # This method is overridden to accept perm as BasePermissionEnum
+        perm_value = perm.value if hasattr(perm, "value") else perm  # type: ignore
+        return super().has_perm(perm_value, obj)
 
 
 class CustomerNote(models.Model):
@@ -198,3 +194,44 @@ class CustomerNote(models.Model):
 
     class Meta:
         ordering = ("date",)
+
+
+class CustomerEvent(models.Model):
+    """Model used to store events that happened during the customer lifecycle."""
+
+    date = models.DateTimeField(default=timezone.now, editable=False)
+    type = models.CharField(
+        max_length=255,
+        choices=[
+            (type_name.upper(), type_name) for type_name, _ in CustomerEvents.CHOICES
+        ],
+    )
+
+    order = models.ForeignKey("order.Order", on_delete=models.SET_NULL, null=True)
+    parameters = JSONField(blank=True, default=dict, encoder=CustomJsonEncoder)
+
+    user = models.ForeignKey(User, related_name="events", on_delete=models.CASCADE)
+
+    class Meta:
+        ordering = ("date",)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(type={self.type!r}, user={self.user!r})"
+
+
+class StaffNotificationRecipient(models.Model):
+    user = models.OneToOneField(
+        User,
+        related_name="staff_notification",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+    )
+    staff_email = models.EmailField(unique=True, blank=True, null=True)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ("staff_email",)
+
+    def get_email(self):
+        return self.user.email if self.user else self.staff_email
